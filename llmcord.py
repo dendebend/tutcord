@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime as dt
 import logging
 from typing import Literal, Optional
+from anthropic import Anthropic
 
 import discord
 import httpx
@@ -41,7 +42,7 @@ if client_id := cfg["client_id"]:
 
 intents = discord.Intents.default()
 intents.message_content = True
-activity = discord.CustomActivity(name=(cfg["status_message"] or "github.com/jakobdylanc/llmcord")[:128])
+activity = discord.CustomActivity(name=(cfg["status_message"] or "I will eat your children")[:128])
 discord_client = discord.Client(intents=intents, activity=activity)
 
 httpx_client = httpx.AsyncClient()
@@ -93,7 +94,6 @@ async def on_message(new_msg):
     provider, model = cfg["model"].split("/", 1)
     base_url = cfg["providers"][provider]["base_url"]
     api_key = cfg["providers"][provider].get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     accept_images = any(x in model.lower() for x in VISION_MODEL_TAGS)
     accept_usernames = any(x in provider.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
@@ -197,19 +197,30 @@ async def on_message(new_msg):
     prev_chunk = None
     edit_task = None
 
-    kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
     try:
         async with new_msg.channel.typing():
-            async for curr_chunk in await openai_client.chat.completions.create(**kwargs):
-                prev_content = prev_chunk.choices[0].delta.content if prev_chunk != None and prev_chunk.choices[0].delta.content else ""
-                curr_content = curr_chunk.choices[0].delta.content or ""
 
-                prev_chunk = curr_chunk
 
-                if not (response_contents or prev_content):
-                    continue
+            if provider == "anthropic":
+                client = Anthropic(api_key=api_key)
 
-                if response_contents == [] or len(response_contents[-1] + prev_content) > max_message_length:
+                # Get system message and remove it from messages array
+                system_message = next((msg["content"] for msg in messages if msg["role"] == "system"), None)
+                chat_messages = [msg for msg in messages if msg["role"] != "system"]
+
+                kwargs = dict(
+                    model=model,
+                    messages=chat_messages,
+                    system=system_message,
+                    max_tokens=cfg["extra_api_parameters"].get("max_tokens", 4096),
+                )
+
+                message = client.messages.create(**kwargs)
+                prev_content = message.content[0].text if message.content else ""
+                curr_content = ""
+
+                # Initialize response if we have content
+                if prev_content:
                     response_contents.append("")
 
                     if not use_plain_responses:
@@ -226,26 +237,76 @@ async def on_message(new_msg):
 
                         last_task_time = dt.now().timestamp()
 
-                response_contents[-1] += prev_content
+                    response_contents[-1] += prev_content
 
-                if not use_plain_responses:
-                    finish_reason = curr_chunk.choices[0].finish_reason
+                    if not use_plain_responses:
+                        is_final_edit = True  # Since we're not streaming
+                        is_good_finish = True
 
-                    ready_to_edit = (edit_task == None or edit_task.done()) and dt.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and any(finish_reason.lower() == x for x in ("stop", "end_turn"))
-
-                    if ready_to_edit or is_final_edit:
                         if edit_task != None:
                             await edit_task
 
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                        embed.description = response_contents[-1]
+                        embed.color = EMBED_COLOR_COMPLETE
 
                         edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
 
                         last_task_time = dt.now().timestamp()
+
+            else:
+                client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+                kwargs = dict(
+                    model=model,
+                    messages=messages[::-1],
+                    stream=True,
+                    extra_body=cfg["extra_api_parameters"]
+                )
+                async for curr_chunk in await client.chat.completions.create(**kwargs):
+                    prev_content = prev_chunk.choices[0].delta.content if prev_chunk != None and prev_chunk.choices[0].delta.content else ""
+                    curr_content = curr_chunk.choices[0].delta.content or ""
+
+                    prev_chunk = curr_chunk
+
+                    if not (response_contents or prev_content):
+                        continue
+
+                    if response_contents == [] or len(response_contents[-1] + prev_content) > max_message_length:
+                        response_contents.append("")
+
+                        if not use_plain_responses:
+                            embed = discord.Embed(description=(prev_content + STREAMING_INDICATOR), color=EMBED_COLOR_INCOMPLETE)
+                            for warning in sorted(user_warnings):
+                                embed.add_field(name=warning, value="", inline=False)
+
+                            reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
+                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                            response_msgs.append(response_msg)
+
+                            msg_nodes[response_msg.id] = MsgNode(next_msg=new_msg)
+                            await msg_nodes[response_msg.id].lock.acquire()
+
+                            last_task_time = dt.now().timestamp()
+
+                    response_contents[-1] += prev_content
+
+                    if not use_plain_responses:
+                        finish_reason = curr_chunk.choices[0].finish_reason
+
+                        ready_to_edit = (edit_task == None or edit_task.done()) and dt.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
+                        msg_split_incoming = len(response_contents[-1] + curr_content) > max_message_length
+                        is_final_edit = finish_reason != None or msg_split_incoming
+                        is_good_finish = finish_reason != None and any(finish_reason.lower() == x for x in ("stop", "end_turn"))
+
+                        if ready_to_edit or is_final_edit:
+                            if edit_task != None:
+                                await edit_task
+
+                            embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                            embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+
+                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
+
+                            last_task_time = dt.now().timestamp()
 
             if use_plain_responses:
                 for content in response_contents:
